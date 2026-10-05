@@ -124,6 +124,26 @@ def destination_capable_backends() -> frozenset[str]:
     return frozenset(_DESTINATION_BY_CALLBACK) & frozenset(DYNAMIC_HEADERS_BY_CALLBACK)
 
 
+#: The callback vars that sample a backend's traffic, as ``(success, error)`` rate
+#: names. Only Arize has them today; the fan-out reads the rates off the destination.
+_SAMPLING_RATE_VARS_BY_CALLBACK: Final[Mapping[str, tuple[str, str]]] = MappingProxyType(
+    {"arize": ("arize_success_sampling_rate", "arize_error_sampling_rate")}
+)
+
+
+def _sampling_rates(callback_name: str, params: StandardCallbackDynamicParams) -> tuple[float | None, float | None]:
+    from litellm.integrations.arize.arize import parse_sampling_rate
+
+    rate_vars: Final = _SAMPLING_RATE_VARS_BY_CALLBACK.get(callback_name)
+    if rate_vars is None:
+        return (None, None)
+    success_var, error_var = rate_vars
+    return (
+        parse_sampling_rate(params.get(success_var), success_var),
+        parse_sampling_rate(params.get(error_var), error_var),
+    )
+
+
 def destination_for(
     callback_name: str,
     params: StandardCallbackDynamicParams,
@@ -149,6 +169,7 @@ def destination_for(
     if resolved is None:
         return None
     endpoint, protocol = resolved
+    success_sampling_rate, error_sampling_rate = _sampling_rates(callback_name, params)
     return OtelDestination(
         endpoint=endpoint,
         headers=MappingProxyType(dict(headers)),
@@ -156,4 +177,6 @@ def destination_for(
         callback_name=callback_name,
         protocol=protocol,
         span_scope=_span_scope(callback_name, params),
+        success_sampling_rate=success_sampling_rate,
+        error_sampling_rate=error_sampling_rate,
     )

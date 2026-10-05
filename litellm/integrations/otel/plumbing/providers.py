@@ -33,7 +33,7 @@ from opentelemetry.sdk.trace.export import (
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
     InMemorySpanExporter,
 )
-from opentelemetry.trace import Span, SpanContext, SpanKind, Status, Tracer
+from opentelemetry.trace import Span, SpanContext, SpanKind, Status, StatusCode, Tracer
 from opentelemetry.util.re import parse_env_headers
 from opentelemetry.util.types import Attributes, AttributeValue
 
@@ -441,6 +441,32 @@ def is_llm_call_span(span: ReadableSpan) -> bool:
     return GenAI.OPERATION_NAME in attributes and MCP.METHOD_NAME not in attributes
 
 
+_TRACE_ID_DRAW_SPACE: Final = 1 << 64
+
+
+def _trace_id_draw(span: ReadableSpan) -> float:
+    """The low 64 bits of the trace id as a fraction in ``[0, 1)``, the way the SDK's
+    ``TraceIdRatioBased`` sampler reads them, so every span of one request tree
+    lands on the same side of the rate."""
+    context: Final = span.context
+    trace_id: Final = context.trace_id if context is not None else 0
+    return (trace_id % _TRACE_ID_DRAW_SPACE) / _TRACE_ID_DRAW_SPACE
+
+
+def _sampled(span: ReadableSpan, destination: "OtelDestination", draw: Callable[[ReadableSpan], float]) -> bool:
+    """Whether the destination's sampling rate keeps this span, read the way the legacy
+    Arize callback reads ``arize_success_sampling_rate`` / ``arize_error_sampling_rate``:
+    an unset rate keeps everything and ``0.0`` keeps nothing."""
+    rate: Final = (
+        destination.error_sampling_rate
+        if span.status.status_code is StatusCode.ERROR
+        else destination.success_sampling_rate
+    )
+    if rate is None:
+        return True
+    return rate > 0.0 and draw(span) <= rate
+
+
 def _in_scope(span: ReadableSpan, scope: "OtelSpanScope") -> bool:
     return scope == "full" or is_llm_call_span(span)
 
@@ -559,8 +585,10 @@ class TenantFanOutSpanProcessor(SpanProcessor):
         excluded_db_systems: frozenset[str] = frozenset(),
         pending_drains: int = _MAX_PENDING_DRAINS,
         drain_pool: _DrainPool | None = None,
+        sampling_draw: Callable[[ReadableSpan], float] | None = None,
     ) -> None:
         self._operator_sinks: Final = operator_sinks
+        self._draw: Final = sampling_draw if sampling_draw is not None else _trace_id_draw
         self._excluded_db_systems: Final = excluded_db_systems
         self._drain_seconds: Final = shutdown_drain_seconds
         self._lock: Final = threading.Condition()
@@ -582,6 +610,7 @@ class TenantFanOutSpanProcessor(SpanProcessor):
                 self._operator_already_writes(span, destination, suppressed)
                 or not _in_scope(span, destination.span_scope)
                 or _is_excluded_database_span(attributes, self._excluded_db_systems)
+                or not _sampled(span, destination, self._draw)
             ):
                 continue
             processor = self._acquire(destination)
