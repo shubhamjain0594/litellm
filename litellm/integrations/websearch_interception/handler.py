@@ -1557,7 +1557,6 @@ class WebSearchInterceptionLogger(CustomLogger):
                 search_litellm_params = dict[str, object](tool_params)
                 search_provider = tool_params.get("search_provider")
 
-            # Fallback to perplexity if no router, no search tools configured, or the tool names no provider
             if not search_provider:
                 self._authorize_unregistered_search_fallback(kwargs=kwargs)
                 search_provider = "perplexity"
