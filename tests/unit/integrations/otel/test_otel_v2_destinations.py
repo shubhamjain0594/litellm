@@ -2370,6 +2370,113 @@ class TestPresetDegradation:
         assert "http://collector.local:4318" in {spec.endpoint for spec in langtrace.config.exporters}
 
 
+def credential_less_arize(monkeypatch) -> None:
+    """An operator with no Arize account and no generic OTLP collector or headers."""
+    for name in (
+        "ARIZE_SPACE_ID",
+        "ARIZE_SPACE_KEY",
+        "ARIZE_API_KEY",
+        "ARIZE_ENDPOINT",
+        "ARIZE_HTTP_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+        *_OTEL_SHORTHAND_ENV,
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+ARIZE_DEST = OtelDestination(
+    endpoint="https://otlp.arize.com/v1",
+    headers={"arize-space-id": "space-team", "api_key": "key-team"},
+    callback_name="arize",
+    protocol="otlp_grpc",
+)
+
+
+class TestArizeTenantOnly:
+    """An operator whose teams each bring their own Arize space keeps no Arize
+    credentials of their own; the preset then exports nowhere for traffic without a
+    team destination instead of posting it keyless to Arize."""
+
+    @staticmethod
+    def _processor_kinds(provider: TracerProvider) -> list[str]:
+        return [type(p).__name__ for p in provider._active_span_processor._span_processors]
+
+    def test_a_credential_less_arize_builds_no_exporter_of_its_own(self, monkeypatch):
+        credential_less_arize(monkeypatch)
+
+        config = arize_preset(allow_missing_credentials=True)
+        provider = build_tracer_provider(config, tenant_overrides=True)
+
+        assert self._processor_kinds(provider) == ["LiteLLMBaggageSpanProcessor"]
+        assert "openinference" in config.mapper_names
+
+    def test_the_operators_own_credentials_still_build_the_operators_exporter(self, monkeypatch):
+        credential_less_arize(monkeypatch)
+        monkeypatch.setenv("ARIZE_SPACE_ID", "space-operator")
+        monkeypatch.setenv("ARIZE_API_KEY", "key-operator")
+
+        provider = build_tracer_provider(arize_preset(allow_missing_credentials=True), tenant_overrides=True)
+
+        assert self._processor_kinds(provider).count("_OverriddenBackendFilter") == 1
+
+    def test_the_standard_otlp_headers_still_build_the_operators_exporter(self, monkeypatch):
+        credential_less_arize(monkeypatch)
+        monkeypatch.setenv("OTEL_EXPORTER_OTLP_TRACES_HEADERS", "space_id=space-operator,api_key=key-operator")
+
+        provider = build_tracer_provider(arize_preset(allow_missing_credentials=True), tenant_overrides=True)
+
+        assert self._processor_kinds(provider).count("_OverriddenBackendFilter") == 1
+
+    def test_a_credential_less_arize_still_delivers_a_team_destination(self, monkeypatch):
+        credential_less_arize(monkeypatch)
+        dest_exporter = InMemorySpanExporter()
+        provider = build_tracer_provider(arize_preset(allow_missing_credentials=True), tenant_overrides=True)
+        provider.add_span_processor(
+            TenantFanOutSpanProcessor(processor_factory=lambda _d: SimpleSpanProcessor(dest_exporter))
+        )
+
+        def run():
+            set_request_destinations((ARIZE_DEST,))
+            emit(provider)
+
+        in_fresh_context(run)
+
+        assert self._processor_kinds(provider) == ["LiteLLMBaggageSpanProcessor", "TenantFanOutSpanProcessor"]
+        assert [s.name for s in dest_exporter.get_finished_spans()] == ["chat gpt-4"]
+
+    def test_a_credential_less_proxy_builds_the_gated_arize_logger_beside_a_v2_carrier(self, monkeypatch):
+        from litellm.litellm_core_utils.litellm_logging import _maybe_construct_otel_v2
+
+        credential_less_arize(monkeypatch)
+        monkeypatch.setenv("LITELLM_OTEL_V2", "true")
+        carrier = build_otel_v2_logger(OpenTelemetryV2Config(exporter="in_memory"))
+
+        def run():
+            set_request_destinations((ARIZE_DEST,))
+            return _maybe_construct_otel_v2("arize", [carrier])
+
+        is_otel_v2_enabled.cache_clear()
+        logger = in_fresh_context(run)
+        is_otel_v2_enabled.cache_clear()
+
+        assert logger is not None
+        assert all(spec.requires_headers and not spec.headers for spec in logger.config.exporters)
+
+    def test_a_credential_less_arize_with_no_destinations_falls_back_to_the_legacy_path(self, monkeypatch):
+        """Nothing can use a credential-less Arize here, so the operator gets the same
+        story as before v2 rather than a global provider that posts keyless spans."""
+        from litellm.litellm_core_utils.litellm_logging import _maybe_construct_otel_v2
+
+        credential_less_arize(monkeypatch)
+        monkeypatch.setenv("LITELLM_OTEL_V2", "true")
+
+        is_otel_v2_enabled.cache_clear()
+        logger = in_fresh_context(_maybe_construct_otel_v2, "arize", [])
+        is_otel_v2_enabled.cache_clear()
+
+        assert logger is None
+
+
 class TestContextIsolation:
     def test_destinations_do_not_leak_between_requests(self):
         def first():
